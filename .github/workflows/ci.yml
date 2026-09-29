@@ -1,0 +1,134 @@
+name: PM-AJAY Automated CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-quality-and-test:
+    name: Build, Audit & Test Engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+          pip install reportlab flake8 pytest
+
+      - name: Lint Codebase (PEP 8 Audit)
+        run: |
+          # Stop build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv,.git,__pycache__
+          # Warning audit for code formatting complexity
+          flake8 . --count --exit-zero --max-complexity=15 --max-line-length=140 --statistics --exclude=venv,.git,__pycache__
+
+      - name: Verify SQLite DB Schema & Catalog Seeding
+        run: |
+          python -c "
+          from app.database import init_db, get_db
+          init_db()
+          conn = get_db()
+          cur = conn.cursor()
+          cur.execute('SELECT COUNT(*) FROM nsqf_courses;')
+          courses_count = cur.fetchone()[0]
+          cur.execute('SELECT COUNT(*) FROM training_centers;')
+          centers_count = cur.fetchone()[0]
+          cur.execute('SELECT COUNT(*) FROM district_clusters;')
+          clusters_count = cur.fetchone()[0]
+          conn.close()
+          assert courses_count > 0, 'Error: NSQF courses table was not seeded'
+          assert centers_count > 0, 'Error: Training centers table was not seeded'
+          assert clusters_count > 0, 'Error: District clusters table was not seeded'
+          print(f'[✓] Database validation passed: {courses_count} courses, {centers_count} centers, {clusters_count} clusters seeded.')
+          "
+
+      - name: Execute Conversational State Machine Integrity Tests
+        run: |
+          python -c "
+          from app.orchestrator import ConversationManager
+          
+          # Test 1: Direct Numeric Index Routing (Button 1 -> No Schooling)
+          slots = {}
+          step1 = ConversationManager.get_current_step(slots)
+          assert step1 == 'formal_education', f'Expected formal_education, got {step1}'
+          updated = ConversationManager.extract_slots('1', slots)
+          assert updated.get('formal_education') == 'No Formal Education', f'Index 1 failed: {updated}'
+
+          # Test 2: Direct Numeric Index Routing (Button 1 -> Leathercraft)
+          step2 = ConversationManager.get_current_step(updated)
+          assert step2 == 'traditional_trade', f'Expected traditional_trade, got {step2}'
+          updated = ConversationManager.extract_slots('1', updated)
+          assert updated.get('traditional_trade') == 'leather', f'Trade matching failed: {updated}'
+
+          # Test 3: Natural Language Phrase Extraction
+          updated = ConversationManager.extract_slots('खुद का काम करना है', updated)
+          assert updated.get('employment_type') == 'SELF_EMPLOYED', f'Employment matching failed: {updated}'
+
+          updated = ConversationManager.extract_slots('15 किमी', updated)
+          assert updated.get('mobility_radius_km') == 15, f'Mobility matching failed: {updated}'
+
+          assert ConversationManager.get_current_step(updated) == 'COMPLETED', 'Pipeline should be completed'
+          print('[✓] Conversational state machine and deterministic slot extraction passed.')
+          "
+
+      - name: Verify NSQF Alignment & GIA Subsidy Calculations
+        run: |
+          python -c "
+          from app.matching_engine import match_nsqf_pathways
+          
+          mock_slots = {
+              'formal_education': 'No Formal Education',
+              'traditional_trade': 'leather',
+              'employment_type': 'SELF_EMPLOYED',
+              'mobility_radius_km': 25
+          }
+          recs = match_nsqf_pathways(mock_slots, user_lat=23.2599, user_lon=77.4126)
+          assert len(recs) > 0, 'Matching engine failed to return recommendations'
+          top = recs[0]
+          assert top['is_rpl_bridge'] == True, 'RPL bypass gate failed for uneducated traditional artisan'
+          assert '₹50,000' in top['gia_benefit']['grant_amount'], 'GIA capital grant calculation failed'
+          print(f'[✓] NSQF matching engine and GIA grant calculation passed: matched {top[\"qp_name\"]}')
+          "
+
+      - name: Verify Server-Side ReportLab PDF Synthesis
+        run: |
+          python -c "
+          import uuid
+          from app.database import init_db, get_db
+          from app.main import download_dossier_pdf
+          
+          init_db()
+          session_id = str(uuid.uuid4())
+          conn = get_db()
+          cur = conn.cursor()
+          cur.execute('''
+          INSERT INTO beneficiaries (session_id, formal_education, traditional_trade, employment_type, mobility_radius_km)
+          VALUES (?, '8th Pass', 'leather', 'SELF_EMPLOYED', 15);
+          ''', (session_id,))
+          conn.commit()
+          conn.close()
+
+          response = download_dossier_pdf(session_id, lang='hi')
+          pdf_stream = response.body_iterator
+          pdf_bytes = b''.join([chunk for chunk in pdf_stream])
+          assert len(pdf_bytes) > 1000, 'PDF generation produced empty/corrupted buffer'
+          assert pdf_bytes.startswith(b'%PDF'), 'PDF binary signature missing'
+          print(f'[✓] ReportLab PDF engine passed: generated {len(pdf_bytes)} bytes.')
+          "
