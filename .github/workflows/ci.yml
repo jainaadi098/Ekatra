@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build, Audit & Test Engine
+    name: Build, Audit & Test Collective Batch Engine
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -30,81 +30,50 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
-          pip install flake8 pytest
 
-      - name: Syntax & Import Integrity Audit
+      - name: Syntax & Lint Audit
         run: |
           flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Verify SQLite DB Schema & Catalog Seeding
+      - name: Test Database Seeding & Schema Integrity
         run: |
           python -c "
-          from app.database import init_db, get_db
+          from app.database import init_db, SessionLocal, TrainingCenter, BeneficiaryProfile
           init_db()
-          conn = get_db()
-          cur = conn.cursor()
-          cur.execute('SELECT COUNT(*) FROM nsqf_courses;')
-          c_cnt = cur.fetchone()[0]
-          cur.execute('SELECT COUNT(*) FROM training_centers;')
-          t_cnt = cur.fetchone()[0]
-          conn.close()
-          assert c_cnt > 0, 'Catalog seed failed: no courses found'
-          assert t_cnt > 0, 'Catalog seed failed: no centers found'
-          print(f'[✓] Database bootstrapped: {c_cnt} courses, {t_cnt} centers.')
+          db = SessionLocal()
+          centers = db.query(TrainingCenter).count()
+          candidates = db.query(BeneficiaryProfile).count()
+          db.close()
+          assert centers >= 3, f'Expected >=3 centers, found {centers}'
+          assert candidates >= 14, f'Expected >=14 synthetic candidates, found {candidates}'
+          print(f'[✓] Database verified: {centers} hubs, {candidates} pooled candidates.')
           "
 
-      - name: Execute Conversational State Machine Integrity Tests
+      - name: Test Multi-Dialect Normalizer & Oral RPL Engine
         run: |
           python -c "
-          from app.orchestrator import ConversationManager
-          slots = {}
-          updated = ConversationManager.extract_slots('1', slots)
-          assert updated.get('formal_education') == 'No Formal Education', 'Step 1 extraction failed'
-          updated = ConversationManager.extract_slots('1', updated)
-          assert updated.get('traditional_trade') == 'leather', 'Step 2 extraction failed'
-          updated = ConversationManager.extract_slots('खुद का काम करना है', updated)
-          assert updated.get('employment_type') == 'SELF_EMPLOYED', 'Step 3 extraction failed'
-          updated = ConversationManager.extract_slots('15 किमी', updated)
-          assert updated.get('mobility_radius_km') == 15, 'Step 4 extraction failed'
-          assert ConversationManager.get_current_step(updated) == 'COMPLETED', 'Machine did not reach terminal state'
-          print('[✓] State machine and 1-to-1 deterministic routing passed.')
+          from app.dialect_engine import DialectEngine
+          norm = DialectEngine.normalize('Hau, hum solar seekhan chahat hain', 'bundelkhandi')
+          assert 'affirmative' in norm, f'Bundelkhandi normalization failed: {norm}'
+          q_id, q_text = DialectEngine.get_oral_question('solar_installer', 'bundelkhandi')
+          assert len(q_text) > 10, 'Prompt retrieval failed'
+          score, gaps = DialectEngine.evaluate_oral_rubric('solar_installer', q_id, 'Dakshin disha mein lagayenge')
+          assert score >= 0.5, f'Rubric evaluation failed: score={score}'
+          print(f'[✓] Dialect engine & oral rubric test passed: {score * 100}% score.')
           "
 
-      - name: Verify NSQF Matching & RPL Bypass Gate
+      - name: Test Google OR-Tools Collective Batch Solver
         run: |
           python -c "
-          from app.matching_engine import match_nsqf_pathways
-          mock = {
-              'formal_education': 'No Formal Education',
-              'traditional_trade': 'leather',
-              'employment_type': 'SELF_EMPLOYED',
-              'mobility_radius_km': 25
-          }
-          recs = match_nsqf_pathways(mock, 23.2599, 77.4126)
-          assert len(recs) > 0, 'Matching engine failed'
-          assert recs[0]['is_rpl_bridge'] == True, 'RPL bypass gate failure'
-          assert '₹50,000' in recs[0]['gia_benefit']['grant_amount'], 'GIA subsidy calculation mismatch'
-          print('[✓] NSQF pathways & GIA 50-40-10 financial math verified.')
-          "
-
-      - name: Verify Headless ReportLab PDF Synthesis
-        run: |
-          python -c "
-          import uuid
-          from app.database import init_db, get_db
-          from app.main import download_dossier_pdf
-          init_db()
-          sid = str(uuid.uuid4())
-          conn = get_db()
-          cur = conn.cursor()
-          cur.execute('''
-          INSERT INTO beneficiaries (session_id, formal_education, traditional_trade, employment_type, mobility_radius_km)
-          VALUES (?, '10th Pass', 'leather', 'SELF_EMPLOYED', 15);
-          ''', (sid,))
-          conn.commit()
-          conn.close()
-          resp = download_dossier_pdf(sid, lang='hi')
-          assert resp.status_code == 200, f'Expected 200, got {resp.status_code}'
-          assert resp.media_type == 'application/pdf', 'MIME type mismatch'
-          print('[✓] ReportLab PDF engine compiles valid binary appraisal stream.')
+          from app.matching_engine import CollectiveBatchSolver
+          solver = CollectiveBatchSolver(target_capacity=20, min_viable_threshold=12)
+          candidates = [
+              {'id': i, 'aspired_trade': 'solar_installer', 'latitude': 23.2599 + (i*0.0005), 'longitude': 77.4126, 'mobility_radius_km': 6.0, 'batch_id': None}
+              for i in range(15)
+          ]
+          centers = [{'id': 1, 'center_name': 'Panchayat Hub', 'center_type': 'PANCHAYAT_BHAWAN', 'block': 'Phanda', 'latitude': 23.2599, 'longitude': 77.4126}]
+          batches = solver.solve_cohort_allocations(candidates, centers, 'solar_installer')
+          assert len(batches) == 1, 'Solver failed to form batch'
+          assert batches[0]['enrolled_count'] == 15, 'Batch enrolled count mismatch'
+          print(f'[✓] OR-Tools solver passed: Formed batch with {batches[0][\"enrolled_count\"]} candidates.')
           "
