@@ -1,38 +1,32 @@
 import os
-import uuid
 import io
-import time
+import html
+import uuid
 import logging
-import unicodedata
-import re
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, Depends, HTTPException, Query, Request
+
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-# ReportLab core engines
+# ReportLab: Flowables (Pure Paragraph & Spacer Layout)
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-from app.database import init_db, get_db, BeneficiaryProfile, TrainingCenter
+from app.database import init_db, get_db, BeneficiaryProfile, TrainingCenterNode
 from app.orchestrator import ConversationalOrchestrator
-from app.dialect_engine import DialectEngine
-from app.matching_engine import CollectiveBatchSolver, calculate_gia_subsidy_split
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ekatra")
 
 init_db()
 
-app = FastAPI(
-    title="Ekatra: PM-AJAY Collective Livelihood Aggregation Portal",
-    version="4.2.0"
-)
+app = FastAPI(title="Ekatra: PM-AJAY Livelihood Aggregator", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,16 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.middleware("http")
-async def log_telemetry_header(request: Request, call_next):
-    start = time.perf_counter()
-    response = await call_next(request)
-    duration_ms = (time.perf_counter() - start) * 1000.0
-    response.headers["X-Response-Time-MS"] = f"{duration_ms:.2f}"
-    return response
-
-
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -59,332 +43,274 @@ if os.path.exists(static_dir):
 ACTIVE_CALLS: Dict[str, Dict[str, Any]] = {}
 
 
-def sanitize_pdf_text(text: Any, default_val: str = "N/A") -> str:
-    """
-    ReportLab standard Helvetica font requires Latin-1 compatible strings.
-    Converts Hindi/Indic script safely to readable transliterated text.
-    """
-    if not text:
-        return default_val
-    text_str = str(text).strip()
-    
-    # Common Indic transliteration replacements for PDF generation
-    replacements = {
-        "आवेदक": "Aavedak (Beneficiary)",
-        "भोपाल": "Bhopal",
-        "रतनपुर": "Ratanpur",
-        "फंदा": "Phanda",
-        "दुकान": "Retail Store / Shop",
-        "व्यवसाय": "Micro-Enterprise Business",
-        "खेती": "Agriculture",
-        "सिलाई": "Apparel & Tailoring",
-        "सोलर": "Solar PV Technology",
-        "बिजली": "Electrical Wiring",
-        "पास": "Pass",
-        "12वीं": "12th Standard",
-        "10वीं": "10th Standard",
-        "8वीं": "8th Standard",
-        "5वीं": "5th Standard"
-    }
-    for k, v in replacements.items():
-        if k in text_str:
-            text_str = text_str.replace(k, v)
-
-    # Encode safely to ASCII, ignoring invalid byte-range chars
-    ascii_safe = text_str.encode('ascii', errors='ignore').decode('ascii').strip()
-    return ascii_safe if len(ascii_safe) > 0 else default_val
-
-
-class CallTurnRequest(BaseModel):
+class TurnPayload(BaseModel):
     session_id: str
     user_utterance: str
     dialect: Optional[str] = "hindi"
 
 
+def sanitize_pdf_text(val: Any, default: str = "N/A") -> str:
+    """
+    Prevents Latin-1 encoder panics and escapes XML reserved symbols
+    to eliminate ReportLab ExpatError and UnicodeEncodeError crashes.
+    """
+    if val is None:
+        return default
+    text = str(val).strip()
+    if not text:
+        return default
+    clean = text.encode("ascii", errors="ignore").decode("ascii").strip()
+    return html.escape(clean) if clean else default
+
+
 @app.get("/")
-async def serve_index():
-    index_file = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_file):
-        return FileResponse(index_file)
-    return {"status": "Active", "message": "Ekatra Engine Online"}
+def index():
+    path = os.path.join(static_dir, "index.html")
+    if os.path.exists(path):
+        return FileResponse(path)
+    return {"status": "Ekatra Engine Online"}
 
 
 @app.post("/api/call/start")
-async def start_session(dialect: str = Query("hindi")):
+def start_call():
     session_id = str(uuid.uuid4())
     session_data = {
         "session_id": session_id,
         "current_step": "GREETING",
-        "dialect": dialect,
-        "enrollment_confirmed": False,
-        "is_completed": False
+        "enrollment_confirmed": False
     }
     ACTIVE_CALLS[session_id] = session_data
-
-    prompt = DialectEngine.get_prompt("GREETING", dialect)
-    options = ["हाँ, शुरू करें", "नहीं, बाद में"]
-
     return {
         "session_id": session_id,
-        "spoken_prompt": prompt,
-        "current_step": "GREETING",
-        "options": options,
-        "suggested_courses": [],
-        "enrollment_confirmed": False
+        "spoken_prompt": "नमस्ते! PM-AJAY आजीविका व कौशल मैपिंग पोर्टल में आपका स्वागत है। क्या हम पंजीकरण शुरू करें?",
+        "options": ["हाँ, शुरू करें", "नहीं, बाद में"]
     }
 
 
 @app.post("/api/call/turn")
-async def process_turn(payload: CallTurnRequest, db: Session = Depends(get_db)):
-    try:
-        session_data = ACTIVE_CALLS.get(payload.session_id)
-        if not session_data:
-            session_data = {
-                "session_id": payload.session_id,
-                "current_step": "GREETING",
-                "dialect": payload.dialect or "hindi",
-                "enrollment_confirmed": False,
-                "is_completed": False
-            }
-            ACTIVE_CALLS[payload.session_id] = session_data
+def execute_turn(payload: TurnPayload, db: Session = Depends(get_db)):
+    session_data = ACTIVE_CALLS.get(payload.session_id)
+    if not session_data:
+        session_data = {"session_id": payload.session_id, "current_step": "GREETING"}
+        ACTIVE_CALLS[payload.session_id] = session_data
 
-        session_data["dialect"] = payload.dialect
-        prompt, updated_session, is_finished, options, courses = ConversationalOrchestrator.advance_dialogue(
-            session_data, payload.user_utterance, payload.dialect
-        )
-        ACTIVE_CALLS[payload.session_id] = updated_session
+    prompt, session_data, is_finished, options, courses = ConversationalOrchestrator.advance_dialogue(
+        session_data, payload.user_utterance, payload.dialect
+    )
+    ACTIVE_CALLS[payload.session_id] = session_data
 
-        is_enrolled = bool(updated_session.get("enrollment_confirmed", False))
-        course_info = updated_session.get("selected_course")
-
-        # Database transaction fault tolerance
-        if is_enrolled:
-            try:
-                course = updated_session.get("selected_course") or {}
-                beneficiary = db.query(BeneficiaryProfile).filter(
-                    BeneficiaryProfile.session_id == payload.session_id
-                ).first()
-
-                if not beneficiary:
-                    beneficiary = BeneficiaryProfile(
-                        session_id=payload.session_id,
-                        full_name=updated_session.get("full_name", "Aavedak"),
-                        village=updated_session.get("village", "Bhopal"),
-                        block="Phanda",
-                        district="Bhopal",
-                        latitude=23.2599,
-                        longitude=77.4126,
-                        preferred_dialect=payload.dialect or "hindi",
-                        voice_consent_granted=True,
-                        formal_education=updated_session.get("formal_education", "12th Pass"),
-                        current_occupation=updated_session.get("current_occupation", "Retail Store"),
-                        aspired_trade=updated_session.get("aspired_trade", "retail_business"),
-                        selected_course_title=course.get("title", "Micro-Enterprise Retailer"),
-                        selected_course_id=course.get("id", "RET/Q0101"),
-                        oral_rpl_score=updated_session.get("oral_rpl_score", 0.95),
-                        mobility_radius_km=5.0,
-                        enrollment_confirmed=True
-                    )
-                    db.add(beneficiary)
-                else:
-                    beneficiary.enrollment_confirmed = True
-                    beneficiary.selected_course_title = course.get("title", "Micro-Enterprise Retailer")
-                    beneficiary.selected_course_id = course.get("id", "RET/Q0101")
-
-                db.commit()
-                logger.info(f"[DB] Enrollment persisted for {payload.session_id}")
-            except Exception as dbe:
-                db.rollback()
-                logger.error(f"[DB Bypass] In-memory active: {dbe}")
-
-        current_count = 15 if is_enrolled else (14 if course_info else 0)
-
-        return {
-            "session_id": payload.session_id,
-            "spoken_prompt": prompt,
-            "current_step": updated_session.get("current_step"),
-            "is_finished": is_finished,
-            "options": options,
-            "suggested_courses": courses,
-            "enrollment_confirmed": is_enrolled,
-            "profile_card": {
-                "name": updated_session.get("full_name", "प्रतीक्षारत..."),
-                "village": updated_session.get("village", "प्रतीक्षारत..."),
-                "education": updated_session.get("formal_education", "प्रतीक्षारत..."),
-                "selected_course": course_info.get("title") if course_info else "चयन प्रतीक्षारत..."
-            },
-            "live_batch_status": {
-                "has_selected_course": bool(course_info),
-                "is_enrolled": is_enrolled,
-                "trade": course_info.get("title") if course_info else "कोर्स चयन शेष",
-                "current_count": current_count,
-                "target_capacity": 20,
-                "fraction_string": f"{current_count}/20" if course_info else "0/20",
-                "percent_complete": min(100, int((current_count / 20) * 100)) if course_info else 0
-            },
-            "oral_evaluation": {
-                "score": updated_session.get("oral_rpl_score", 0.0)
-            }
-        }
-    except Exception as e:
-        logger.error(f"[Turn Failure]: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/dossier/pdf/{session_id}")
-async def compile_dossier(session_id: str, db: Session = Depends(get_db)):
-    """
-    Generates official PM-AJAY GIA appraisal dossier PDF with Latin-1 safe encoding.
-    Guaranteed zero-crash buffer output.
-    """
-    try:
-        session_data = ACTIVE_CALLS.get(session_id, {})
-        db_profile = db.query(BeneficiaryProfile).filter(BeneficiaryProfile.session_id == session_id).first()
-
-        # Sanitize data to avoid ReportLab Latin-1 encoding crash
-        raw_name = session_data.get("full_name") or (db_profile.full_name if db_profile else "Aadi")
-        raw_village = session_data.get("village") or (db_profile.village if db_profile else "Bhopal")
-        
-        course = session_data.get("selected_course") or {}
-        raw_course_title = course.get("title") or (db_profile.selected_course_title if db_profile else "Micro-Enterprise Retailer & Store Manager")
-        raw_course_id = course.get("id") or (db_profile.selected_course_id if db_profile else "RET/Q0101")
-
-        name = sanitize_pdf_text(raw_name, "Beneficiary Applicant")
-        village = sanitize_pdf_text(raw_village, "Bhopal District")
-        course_title = sanitize_pdf_text(raw_course_title, "Micro-Enterprise Retailer")
-        course_id = sanitize_pdf_text(raw_course_id, "RET/Q0101")
-
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=letter,
-            rightMargin=36,
-            leftMargin=36,
-            topMargin=36,
-            bottomMargin=36
-        )
-        styles = getSampleStyleSheet()
-        story = []
-
-        h_style = ParagraphStyle(
-            'H1',
-            parent=styles['Normal'],
-            fontName='Helvetica-Bold',
-            fontSize=12,
-            alignment=1,
-            textColor=colors.HexColor('#0A3A60')
-        )
-        sub_style = ParagraphStyle(
-            'Sub',
-            parent=styles['Normal'],
-            fontName='Helvetica-Bold',
-            fontSize=10,
-            alignment=1,
-            textColor=colors.HexColor('#333333')
-        )
-
-        story.append(Paragraph("GOVERNMENT OF INDIA - MINISTRY OF SOCIAL JUSTICE & EMPOWERMENT", h_style))
-        story.append(Spacer(1, 4))
-        story.append(Paragraph("PRADHAN MANTRI ANUSUCHIT JAATI ABHYUDAY YOJANA (PM-AJAY)", sub_style))
-        story.append(Paragraph("Grant-in-Aid (GIA) - Beneficiary Appraisal Dossier", sub_style))
-        story.append(Spacer(1, 15))
-
-        profile_table = [
-            [Paragraph("<b>Application ID:</b>", styles['Normal']), Paragraph(f"PMAJAY-{uuid.uuid4().hex[:8].upper()}", styles['Normal'])],
-            [Paragraph("<b>Beneficiary Name:</b>", styles['Normal']), Paragraph(name, styles['Normal'])],
-            [Paragraph("<b>Village / Habitation:</b>", styles['Normal']), Paragraph(f"{village}, District Bhopal", styles['Normal'])],
-            [Paragraph("<b>Allocated NSQF Course:</b>", styles['Normal']), Paragraph(f"{course_title} ({course_id})", styles['Normal'])],
-            [Paragraph("<b>Oral RPL Status:</b>", styles['Normal']), Paragraph("Competency Verified (95%) - Certificate Gate Waived", styles['Normal'])],
-            [Paragraph("<b>Assigned Cohort Node:</b>", styles['Normal']), Paragraph("Gram Panchayat Bhawan Collective Hub (Confirmed 15/20)", styles['Normal'])]
-        ]
-        t1 = Table(profile_table, colWidths=[180, 360])
-        t1.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
-            ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#CBD5E1')),
-            ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
-            ('TOPPADDING', (0,0), (-1,-1), 5),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-        ]))
-        story.append(t1)
-        story.append(Spacer(1, 15))
-
-        story.append(Paragraph("<b>STATUTORY GIA 50-40-10 CAPITAL SUBSIDY SPECIFICATION</b>", styles['Normal']))
-        story.append(Spacer(1, 5))
-        fin_table = [
-            ["Financing Head", "Norm", "Allocation"],
-            ["Standard Micro-Enterprise Base Unit", "100%", "Rs. 1,00,000"],
-            ["PM-AJAY Direct Capital Grant Subsidy", "50% (Max Statutory Cap)", "Rs. 50,000"],
-            ["Institutional Credit (MUDRA / Bank)", "40% Term Loan", "Rs. 40,000"],
-            ["Beneficiary Equity Margin Contribution", "10% Margin Money", "Rs. 10,000"]
-        ]
-        t2 = Table(fin_table, colWidths=[240, 150, 150])
-        t2.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0A3A60')),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
-            ('TOPPADDING', (0,0), (-1,-1), 6),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-        ]))
-        story.append(t2)
-        story.append(Spacer(1, 30))
-
-        sig_data = [
-            ["____________________________________", "____________________________________"],
-            ["Beneficiary Signature / Thumb Impression", "Authorized District Officer (MoSJE / DLC)"]
-        ]
-        t3 = Table(sig_data, colWidths=[270, 270])
-        t3.setStyle(TableStyle([
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('FONTSIZE', (0,1), (-1,1), 9),
-            ('TEXTCOLOR', (0,1), (-1,1), colors.HexColor('#475569'))
-        ]))
-        story.append(t3)
-
-        doc.build(story)
-        buffer.seek(0)
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=Ekatra_Dossier_{session_id[:8]}.pdf"}
-        )
-    except Exception as e:
-        logger.error(f"[PDF Generation Failure]: {e}", exc_info=True)
-        # Emergency pure-ASCII fallback PDF generator
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
-        styles = getSampleStyleSheet()
-        doc.build([
-            Paragraph("PM-AJAY (Ekatra) - Official Beneficiary Appraisal Dossier", styles['Heading1']),
-            Spacer(1, 10),
-            Paragraph("Enrollment Status: Confirmed (15/20 Cohort Allocated)", styles['Normal']),
-            Paragraph(f"Application Ref: PMAJAY-{uuid.uuid4().hex[:8].upper()}", styles['Normal']),
-            Spacer(1, 10),
-            Paragraph("Statutory GIA Subsidy: Rs 50,000 (50%) Direct Capital Grant", styles['Normal']),
-            Paragraph("Bank Loan: Rs 40,000 (40%) Term Loan | Margin: Rs 10,000 (10%)", styles['Normal'])
-        ])
-        buffer.seek(0)
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=Ekatra_Dossier_{session_id[:8]}.pdf"}
-        )
-
-
-@app.get("/api/dashboard/map-analytics")
-async def get_analytics(db: Session = Depends(get_db)):
-    centers = db.query(TrainingCenter).all()
-    candidates = db.query(BeneficiaryProfile).all()
-
-    c_data = [{"id": c.id, "center_name": c.center_name, "center_type": c.center_type, "latitude": c.latitude, "longitude": c.longitude} for c in centers]
-    b_data = [{"id": b.id, "aspired_trade": b.aspired_trade, "latitude": b.latitude, "longitude": b.longitude, "mobility_radius_km": b.mobility_radius_km} for b in candidates]
-
-    solver = CollectiveBatchSolver(target_capacity=20, min_viable_threshold=12)
-    batches = solver.solve_cohort_allocations(b_data, c_data, "retail_business")
-    split = calculate_gia_subsidy_split(100000)
+    # Persist all 9 slots to DB once enrollment is confirmed
+    if session_data.get("enrollment_confirmed"):
+        course = session_data.get("selected_course", {})
+        beneficiary = db.query(BeneficiaryProfile).filter_by(session_id=payload.session_id).first()
+        if not beneficiary:
+            beneficiary = BeneficiaryProfile(
+                session_id=payload.session_id,
+                full_name=session_data.get("full_name", "Applicant"),
+                district=session_data.get("district", "Bhopal"),
+                block=session_data.get("block", "Phanda"),
+                village=session_data.get("village", "Phanda"),
+                latitude=session_data.get("lat", 23.2599),
+                longitude=session_data.get("lon", 77.4126),
+                formal_education=session_data.get("formal_education", "12th Standard"),
+                nsqf_eligible_level=session_data.get("nsqf_eligible_level", 4),
+                current_occupation=session_data.get("current_occupation", "Retail"),
+                oral_rpl_score=session_data.get("oral_rpl_score", 0.95),
+                aspired_trade=session_data.get("aspired_trade", "retail_business"),
+                livelihood_intent=session_data.get("livelihood_intent", "SETUP"),
+                availability_window=session_data.get("availability_window", "Morning Batches"),
+                sc_status_verified=session_data.get("sc_status_verified", True),
+                selected_course_title=course.get("title", "Micro-Enterprise Retailer"),
+                selected_course_id=course.get("id", "RET/Q0101"),
+                allocated_center_name=session_data.get("center", "Gram Panchayat Bhawan"),
+                distance_to_center_km=session_data.get("center_dist", 3.2),
+                radius_status=session_data.get("radius_status", "GREEN"),
+                enrollment_confirmed=True
+            )
+            db.add(beneficiary)
+            db.commit()
+            logger.info(f"[DB Persisted] Profile saved for session {payload.session_id}")
 
     return {
-        "centers": c_data,
-        "solved_batches": batches,
-        "gia_split": split
+        "session_id": payload.session_id,
+        "spoken_prompt": prompt,
+        "current_step": session_data.get("current_step"),
+        "is_finished": is_finished,
+        "options": options,
+        "suggested_courses": courses,
+        "enrollment_confirmed": session_data.get("enrollment_confirmed", False),
+        "profile_card": {
+            "name": session_data.get("full_name", "--"),
+            "district": session_data.get("district", "--"),
+            "block": session_data.get("block", "--"),
+            "center_dist": session_data.get("center_dist"),
+            "radius_status": session_data.get("radius_status", "GREEN"),
+            "schooling": session_data.get("formal_education", "--"),
+            "nsqf_level": session_data.get("nsqf_eligible_level"),
+            "current_work": session_data.get("current_occupation", "--"),
+            "trade": session_data.get("selected_course", {}).get("title", "--"),
+            "livelihood_intent": session_data.get("livelihood_intent", "--"),
+            "availability_window": session_data.get("availability_window", "--")
+        }
     }
+
+
+# ---------------------------------------------------------------------------
+# SEARCH ROUTE: Multi-Parameter Index Search
+# ---------------------------------------------------------------------------
+@app.get("/api/beneficiaries/search")
+def search_beneficiaries(
+    q: Optional[str] = Query(None, description="Search across Name, District, Block, Trade, or Course ID"),
+    district: Optional[str] = None,
+    block: Optional[str] = None,
+    trade: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(BeneficiaryProfile).filter(BeneficiaryProfile.enrollment_confirmed == True)
+    if district:
+        query = query.filter(BeneficiaryProfile.district.ilike(f"%{district}%"))
+    if block:
+        query = query.filter(BeneficiaryProfile.block.ilike(f"%{block}%"))
+    if trade:
+        query = query.filter(BeneficiaryProfile.aspired_trade.ilike(f"%{trade}%"))
+    if q:
+        search_filter = (
+            BeneficiaryProfile.full_name.ilike(f"%{q}%") |
+            BeneficiaryProfile.village.ilike(f"%{q}%") |
+            BeneficiaryProfile.selected_course_id.ilike(f"%{q}%") |
+            BeneficiaryProfile.selected_course_title.ilike(f"%{q}%")
+        )
+        query = query.filter(search_filter)
+
+    records = query.order_by(BeneficiaryProfile.id.desc()).limit(50).all()
+    return [
+        {
+            "id": r.id,
+            "session_id": r.session_id,
+            "name": r.full_name,
+            "district": r.district,
+            "block": r.block,
+            "schooling": r.formal_education,
+            "nsqf_level": f"Level {r.nsqf_eligible_level}",
+            "current_work": r.current_occupation,
+            "desire_trade": r.selected_course_title,
+            "course_id": r.selected_course_id,
+            "center": r.allocated_center_name,
+            "radius_metric": f"{r.distance_to_center_km} Km ({r.radius_status})",
+            "dossier_pdf_url": f"/api/dossier/pdf/{r.session_id}"
+        }
+        for r in records
+    ]
+
+
+# ---------------------------------------------------------------------------
+# DOSSIER PDF GENERATOR: Single-Page Pure Paragraph & Spacer Layout
+# ---------------------------------------------------------------------------
+@app.get("/api/dossier/pdf/{session_id}")
+def generate_dossier_pdf(session_id: str, db: Session = Depends(get_db)):
+    session_data = ACTIVE_CALLS.get(session_id, {})
+    db_profile = db.query(BeneficiaryProfile).filter_by(session_id=session_id).first()
+
+    name = sanitize_pdf_text(session_data.get("full_name") or (db_profile.full_name if db_profile else "Applicant"))
+    district = sanitize_pdf_text(session_data.get("district") or (db_profile.district if db_profile else "Bhopal"))
+    block = sanitize_pdf_text(session_data.get("block") or (db_profile.block if db_profile else "Phanda"))
+    village = sanitize_pdf_text(session_data.get("village") or (db_profile.village if db_profile else "Phanda"))
+    education = sanitize_pdf_text(session_data.get("formal_education") or (db_profile.formal_education if db_profile else "12th Standard"))
+    occupation = sanitize_pdf_text(session_data.get("current_occupation") or (db_profile.current_occupation if db_profile else "Retail"))
+    
+    course_info = session_data.get("selected_course") or {}
+    course_title = sanitize_pdf_text(course_info.get("title") or (db_profile.selected_course_title if db_profile else "Micro-Enterprise Retailer"))
+    course_id = sanitize_pdf_text(course_info.get("id") or (db_profile.selected_course_id if db_profile else "RET/Q0101"))
+    center = sanitize_pdf_text(session_data.get("center") or (db_profile.allocated_center_name if db_profile else "Gram Panchayat Bhawan"))
+    distance = str(session_data.get("center_dist") or (db_profile.distance_to_center_km if db_profile else "3.2"))
+    radius_status = sanitize_pdf_text(session_data.get("radius_status") or (db_profile.radius_status if db_profile else "GREEN"))
+    nsqf_level = str(session_data.get("nsqf_eligible_level") or (db_profile.nsqf_eligible_level if db_profile else "4"))
+    intent = sanitize_pdf_text(session_data.get("livelihood_intent") or (db_profile.livelihood_intent if db_profile else "SETUP"))
+    time_limit = sanitize_pdf_text(session_data.get("availability_window") or (db_profile.availability_window if db_profile else "Morning Batches"))
+    sc_verified = "Yes (Statutory Criteria Matched)" if (session_data.get("sc_status_verified") or (db_profile.sc_status_verified if db_profile else True)) else "General / Other"
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=24,
+        bottomMargin=24
+    )
+    styles = getSampleStyleSheet()
+
+    story = [
+        # 1. Ministry Header
+        Paragraph("<b>GOVERNMENT OF INDIA &bull; MINISTRY OF SOCIAL JUSTICE &amp; EMPOWERMENT</b>", styles['Normal']),
+        Spacer(1, 3),
+        Paragraph("<b>PRADHAN MANTRI ANUSUCHIT JAATI ABHYUDAY YOJANA (PM-AJAY)</b>", styles['Heading2']),
+        Spacer(1, 1),
+        Paragraph("<font size=8 color='#475569'>GIA Component &bull; MP State Mission Directorate &bull; Form-1 Appraisal Dossier</font>", styles['Normal']),
+        Spacer(1, 8),
+
+        # 2. Administrative Status Ribbon
+        Paragraph(f"<b>Application Ref ID:</b> PMAJAY-{session_id[:8].upper()} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Location:</b> {block}, {district} (MP) &nbsp;&nbsp;|&nbsp;&nbsp; <b>Status:</b> <font color='#166534'><b>VERIFIED &amp; ALLOCATED</b></font>", styles['Normal']),
+        Spacer(1, 4),
+        Paragraph("----------------------------------------------------------------------------------------------------------------------------------", styles['Normal']),
+        Spacer(1, 6),
+
+        # 3. Section I: Beneficiary Profile (Slots 1, 4, 5, 9)
+        Paragraph("<b>SECTION I: BENEFICIARY INTAKE PROFILE</b>", styles['Heading3']),
+        Spacer(1, 3),
+        Paragraph(f"<b>&bull; Full Name:</b> {name} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>&bull; Schooling:</b> {education} (Assessed: NSQF Level {nsqf_level})", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph(f"<b>&bull; Habitation / Village:</b> {village} (Tehsil: {block}, District: {district}, Madhya Pradesh)", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph(f"<b>&bull; Current Work / Craft:</b> {occupation} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>&bull; SC Status:</b> <font color='#166534'><b>{sc_verified}</b></font>", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph("<b>&bull; Oral RPL Assessment:</b> <font color='#166534'><b>Competency Verified (95%) &bull; Certificate Gate Waived</b></font>", styles['Normal']),
+        Spacer(1, 8),
+
+        # 4. Section II: Training Center Node & Skilling Allocation (Slots 2, 3, 6, 7, 8)
+        Paragraph("<b>SECTION II: NSQF ACCREDITED SKILLING &amp; CLUSTER NODE</b>", styles['Heading3']),
+        Spacer(1, 3),
+        Paragraph(f"<b>&bull; Allocated Course:</b> <b>{course_title}</b> (QP Code: <b>{course_id}</b>)", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph(f"<b>&bull; Assigned Training Center:</b> {center}", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph(f"<b>&bull; Center Distance:</b> {distance} Km &bull; Radius Status: <b><font color='{'#166534' if radius_status == 'GREEN' else '#DC2626'}'>{radius_status} (&lt;=15 Km Gate Rule)</font></b>", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph(f"<b>&bull; Livelihood Track:</b> {intent} Model &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>&bull; Time Limit:</b> {time_limit}", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph("<b>&bull; Cohort Formulation:</b> <font color='#1E40AF'><b>Confirmed (15/20 Candidates Enrolled in Panchayat Batch)</b></font>", styles['Normal']),
+        Spacer(1, 8),
+
+        # 5. Section III: PM-AJAY Statutory GIA Financial Subsidy (50:40:10 Matrix)
+        Paragraph("<b>SECTION III: STATUTORY GIA 50-40-10 CAPITAL SUBSIDY SPECIFICATION</b>", styles['Heading3']),
+        Spacer(1, 3),
+        Paragraph("<b>1. Base Unit Project Cost:</b> Rs. 1,00,000 (100% Micro-Enterprise Baseline Unit)", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph("<b>2. PM-AJAY Direct Capital Grant (50%):</b> <font color='#166534'><b>Rs. 50,000</b></font> <i>(Direct Capital Subsidy for Tools &amp; Setup)</i>", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph("<b>3. Institutional Credit Term Loan (40%):</b> Rs. 40,000 <i>(MUDRA Shishu / Bank Credit Linkage)</i>", styles['Normal']),
+        Spacer(1, 2),
+        Paragraph("<b>4. Beneficiary Margin Contribution (10%):</b> Rs. 10,000 <i>(Beneficiary Equity Contribution)</i>", styles['Normal']),
+        Spacer(1, 14),
+
+        # 6. Verification Signatures
+        Paragraph("----------------------------------------------------------------------------------------------------------------------------------", styles['Normal']),
+        Spacer(1, 10),
+        Paragraph(f"<b>Beneficiary Signature:</b> _______________________ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Authorized Officer:</b> _______________________", styles['Normal']),
+        Spacer(1, 3),
+        Paragraph(f"Name: {name} (Applicant Verification) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; District Nodal Authority (MoSJE / PM-AJAY MP)", styles['Normal'])
+    ]
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    filename = f"PM_AJAY_Appraisal_{name.replace(' ', '_')}_{session_id[:6]}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Cache-Control": "no-cache, no-store, must-revalidate"
+        }
+    )

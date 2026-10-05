@@ -86,11 +86,19 @@ class CollectiveBatchSolver:
                     pool[i]["id"] for i in range(num_c)
                     if x[i, j].solution_value() > 0.5
                 ]
+
+                # Resilient geographical resolution: village -> block -> center_name fallback
+                resolved_location = (
+                    centers[j].get("village") or
+                    centers[j].get("block") or
+                    centers[j].get("center_name", "Cluster Node")
+                )
+
                 batches.append({
                     "center_id": centers[j]["id"],
                     "center_name": centers[j]["center_name"],
                     "center_type": centers[j]["center_type"],
-                    "village": centers[j].get("village", centers[j]["block"]),
+                    "village": resolved_location,
                     "trade": trade,
                     "enrolled_count": len(assigned_candidates),
                     "target_capacity": self.target_capacity,
